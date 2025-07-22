@@ -771,6 +771,14 @@ def generate_batch_tts(
                         bypass_whisper_checking, whisper_model_name, enable_parallel,
                         num_parallel_workers, use_longest_transcript_on_fail, sound_words_field, use_faster_whisper
                     )
+                    print(f"[DEBUG] process_text_for_tts returned: {type(output_paths)} with {len(output_paths) if hasattr(output_paths, '__len__') else 'unknown'} items")
+                    
+                    # Ensure output_paths is a list before extending
+                    if output_paths is None:
+                        output_paths = []
+                    elif not isinstance(output_paths, (list, tuple)):
+                        output_paths = [output_paths]
+                    
                     all_outputs.extend(output_paths)
                     print(f"[DEBUG] Completed TTS for file: {base}, generated {len(output_paths)} files")
                     
@@ -781,6 +789,8 @@ def generate_batch_tts(
                     print("[DEBUG] Cleared memory after file")
                 except Exception as e:
                     print(f"[ERROR] Failed TTS for file {base}: {e}")
+                    import traceback
+                    traceback.print_exc()
             return all_outputs  # Return list of output files
 
         # ELSE (default: join all text files as one, as before)
@@ -1959,9 +1969,7 @@ def main():
                 debug=False,
                 prevent_thread_lock=False,
                 show_error=True,
-                quiet=False,
-                show_tips=False,
-                enable_queue=True
+                quiet=False
             )
         except KeyboardInterrupt:
             print("\n[INFO] Server stopped by user (Ctrl+C)")
@@ -1978,9 +1986,7 @@ def main():
                     debug=False,
                     prevent_thread_lock=False,
                     show_error=True,
-                    quiet=False,
-                    show_tips=False,
-                    enable_queue=True
+                    quiet=False
                 )
             except Exception as e2:
                 print(f"[ERROR] Failed to restart server: {e2}")
