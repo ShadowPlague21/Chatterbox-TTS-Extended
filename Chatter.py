@@ -25,6 +25,7 @@ import json
 import csv
 import soundfile as sf
 from chatterbox.src.chatterbox.vc import ChatterboxVC
+import markdown
 SETTINGS_PATH = "settings.json"
 #THIS IS THE START
 def load_settings():
@@ -276,7 +277,7 @@ def replace_letter_period_sequences(text: str) -> str:
     
 def remove_inline_reference_numbers(text):
     # Remove reference numbers after sentence-ending punctuation, but keep the punctuation
-    pattern = r'([.!?,\"\'”’)\]])(\d+)(?=\s|$)'
+    pattern = r'([.!?,\"\'")\]])(\d+)(?=\s|$)'
     return re.sub(pattern, r'\1', text)
 
 
@@ -469,7 +470,7 @@ def parse_sound_word_field(user_input):
 def smart_remove_sound_words(text, sound_words):
     for pattern, replacement in sound_words:
         if replacement:
-            # 1. Handle possessive: "Baggins’" or "Baggins'" (optionally with s or S after apostrophe)
+            # 1. Handle possessive: "Baggins's" or "Baggins'" (optionally with s or S after apostrophe)
             text = re.sub(
                 r'(?i)(%s)([’\']s?)' % re.escape(pattern),
                 lambda m: replacement + "'s" if m.group(2) else replacement,
@@ -504,7 +505,7 @@ def smart_remove_sound_words(text, sound_words):
 
     # --- Fix accidental joining of words caused by quote removal ---
     # Add a space if a letter is next to a letter and was separated by removed quote
-    #text = re.sub(r'(\w)([’\'"“”‘’])(\w)', r'\1 \3', text)
+    #text = re.sub(r'(\w)([’\'"")(\w)', r'\1 \3', text)
     # Add a space between lowercase and uppercase, likely joined words (e.g., rainbowPride)
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
 
@@ -516,6 +517,47 @@ def smart_remove_sound_words(text, sound_words):
     text = re.sub(r'(^|[\.!\?]\s*),+', r'\1', text)
     text = re.sub(r',+\s*([\.!\?])', r'\1', text)
     return text.strip()
+
+
+def convert_markdown_to_text(markdown_content: str) -> str:
+    """
+    Convert markdown content to plain text by removing markdown formatting.
+    This function handles common markdown elements like headers, bold, italic, links, etc.
+    """
+    # Convert markdown to HTML first
+    html = markdown.markdown(markdown_content)
+    
+    # Remove HTML tags to get plain text
+    import re
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', html)
+    # Decode HTML entities
+    import html
+    text = html.unescape(text)
+    # Clean up extra whitespace
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    
+    return text
+
+
+def generate_clean_filename(input_basename: str, export_format: str, gen_index: int = 0, num_generations: int = 1) -> str:
+    """
+    Generate a clean filename based on the input file name.
+    If multiple generations, append generation number.
+    """
+    # Clean the basename (remove special characters, keep only alphanumeric, spaces, and common punctuation)
+    import re
+    clean_basename = re.sub(r'[^a-zA-Z0-9\s\-_\.]', '', input_basename)
+    clean_basename = re.sub(r'\s+', '_', clean_basename.strip())
+    
+    # If multiple generations, add generation number
+    if num_generations > 1:
+        filename = f"{clean_basename}_gen{gen_index+1}.{export_format}"
+    else:
+        filename = f"{clean_basename}.{export_format}"
+    
+    return filename
 
 
 def whisper_check_mp(candidate_path, target_text, whisper_model, use_faster_whisper=False):
@@ -611,11 +653,23 @@ def process_one_chunk(
     return (idx, candidates)
 
 def generate_and_preview(*args):
-
-    output_paths = generate_batch_tts(*args)
-    audio_files = [p for p in output_paths if os.path.splitext(p)[1].lower() in [".wav", ".mp3", ".flac"]]
-    dropdown_value = audio_files[0] if audio_files else None
-    return output_paths, gr.Dropdown(choices=audio_files, value=dropdown_value), dropdown_value
+    try:
+        print("[INFO] 🚀 Starting TTS generation...")
+        output_paths = generate_batch_tts(*args)
+        audio_files = [p for p in output_paths if os.path.splitext(p)[1].lower() in [".wav", ".mp3", ".flac"]]
+        dropdown_value = audio_files[0] if audio_files else None
+        
+        if output_paths:
+            print(f"[INFO] ✅ Generation completed successfully! Generated {len(output_paths)} file(s).")
+            print("[INFO] 🎵 Ready for next generation. Interface remains open.")
+        else:
+            print("[WARNING] ⚠️ No output files generated. Please check your settings.")
+            
+        return output_paths, gr.Dropdown(choices=audio_files, value=dropdown_value), dropdown_value
+    except Exception as e:
+        print(f"[ERROR] ❌ Generation failed: {e}")
+        print("[INFO] 🔄 Interface remains open. You can try again.")
+        return [], gr.Dropdown(choices=[], value=None), None
     
 
 def update_audio_preview(selected_path):
@@ -686,28 +740,47 @@ def generate_batch_tts(
                 try:
                     fname = os.path.basename(fobj.name)
                     base = os.path.splitext(fname)[0]
+                    # Keep original filename for cleaner output naming
+                    original_base = base
                     base = re.sub(r'[^a-zA-Z0-9_\-]', '_', base)
                     with open(fobj.name, "r", encoding="utf-8") as f:
                         file_text = f.read()
-                    all_jobs.append((file_text, base))
+                    
+                    # Convert markdown to plain text if it's a .md file
+                    if fname.lower().endswith('.md'):
+                        file_text = convert_markdown_to_text(file_text)
+                        print(f"[INFO] Converted markdown file: {fname}")
+                    
+                    all_jobs.append((file_text, original_base))
                 except Exception as e:
                     print(f"[ERROR] Failed to read file: {getattr(fobj, 'name', repr(fobj))} | {e}")
             # Now process each file separately and collect outputs
             all_outputs = []
             for job_text, base in all_jobs:
-                output_paths = process_text_for_tts(
-                    job_text, base,
-                    audio_prompt_path_input,
-                    exaggeration_input, temperature_input, seed_num_input, cfgw_input,
-                    use_auto_editor, ae_threshold, ae_margin, export_formats, enable_batching,
-                    to_lowercase, normalize_spacing, fix_dot_letters, remove_reference_numbers, keep_original_wav,
-                    smart_batch_short_sentences, disable_watermark, num_generations,
-                    normalize_audio, normalize_method, normalize_level, normalize_tp,
-                    normalize_lra, num_candidates_per_chunk, max_attempts_per_candidate,
-                    bypass_whisper_checking, whisper_model_name, enable_parallel,
-                    num_parallel_workers, use_longest_transcript_on_fail, sound_words_field, use_faster_whisper
-                )
-                all_outputs.extend(output_paths)
+                print(f"[DEBUG] Starting TTS for file: {base}")
+                try:
+                    output_paths = process_text_for_tts(
+                        job_text, base,
+                        audio_prompt_path_input,
+                        exaggeration_input, temperature_input, seed_num_input, cfgw_input,
+                        use_auto_editor, ae_threshold, ae_margin, export_formats, enable_batching,
+                        to_lowercase, normalize_spacing, fix_dot_letters, remove_reference_numbers, keep_original_wav,
+                        smart_batch_short_sentences, disable_watermark, num_generations,
+                        normalize_audio, normalize_method, normalize_level, normalize_tp,
+                        normalize_lra, num_candidates_per_chunk, max_attempts_per_candidate,
+                        bypass_whisper_checking, whisper_model_name, enable_parallel,
+                        num_parallel_workers, use_longest_transcript_on_fail, sound_words_field, use_faster_whisper
+                    )
+                    all_outputs.extend(output_paths)
+                    print(f"[DEBUG] Completed TTS for file: {base}, generated {len(output_paths)} files")
+                    
+                    # Add memory management between files
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print("[DEBUG] Cleared memory after file")
+                except Exception as e:
+                    print(f"[ERROR] Failed TTS for file {base}: {e}")
             return all_outputs  # Return list of output files
 
         # ELSE (default: join all text files as one, as before)
@@ -717,14 +790,27 @@ def generate_batch_tts(
             try:
                 fname = os.path.basename(fobj.name)
                 base = os.path.splitext(fname)[0]
+                # Keep original filename for cleaner output naming
+                original_base = base
                 base = re.sub(r'[^a-zA-Z0-9_\-]', '_', base)
-                basenames.append(base)
+                basenames.append(original_base)
                 with open(fobj.name, "r", encoding="utf-8") as f:
-                    all_text.append(f.read())
+                    file_content = f.read()
+                
+                # Convert markdown to plain text if it's a .md file
+                if fname.lower().endswith('.md'):
+                    file_content = convert_markdown_to_text(file_content)
+                    print(f"[INFO] Converted markdown file: {fname}")
+                
+                all_text.append(file_content)
             except Exception as e:
                 print(f"[ERROR] Failed to read file: {getattr(fobj, 'name', repr(fobj))} | {e}")
         text = "\n\n".join(all_text)
-        input_basename = "_".join(basenames) + "_"
+        # Use the first filename as the base, or combine if multiple files
+        if len(basenames) == 1:
+            input_basename = basenames[0]
+        else:
+            input_basename = "_".join(basenames)
 
         return process_text_for_tts(
             text, input_basename, audio_prompt_path_input,
@@ -844,6 +930,49 @@ def process_text_for_tts(
                     i += 1
         return out
 
+    # Add memory management and safety checks
+    def check_memory_usage():
+        """Check available GPU memory and warn if running low"""
+        try:
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                free = total - reserved
+                
+                print(f"\033[33m[MEMORY] GPU: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {free:.1f}GB free\033[0m")
+                
+                if free < 2.0:  # Less than 2GB free
+                    print(f"\033[31m[WARNING] Low GPU memory! Only {free:.1f}GB free. Consider reducing batch size or text length.\033[0m")
+                    return False
+                return True
+        except Exception as e:
+            print(f"[WARNING] Could not check GPU memory: {e}")
+            return True
+
+    def safe_process_chunk(chunk_text, chunk_index, max_retries=3):
+        """Safely process a chunk with error handling and memory management"""
+        for attempt in range(max_retries):
+            try:
+                # Check memory before processing
+                if not check_memory_usage():
+                    print(f"\033[31m[ERROR] Insufficient memory for chunk {chunk_index}. Skipping.\033[0m")
+                    return None
+                
+                # Force garbage collection
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                return chunk_text
+            except Exception as e:
+                print(f"\033[31m[ERROR] Failed to process chunk {chunk_index} (attempt {attempt + 1}): {e}\033[0m")
+                if attempt == max_retries - 1:
+                    print(f"\033[31m[ERROR] Giving up on chunk {chunk_index} after {max_retries} attempts\033[0m")
+                    return None
+                time.sleep(1)  # Wait before retry
+        return None
+
     sentence_groups = None
     if enable_batching:
         sentence_groups = group_sentences(sentences, max_chars=300)
@@ -854,6 +983,30 @@ def process_text_for_tts(
         sentence_groups = enforce_min_chunk_length(sentence_groups)
     else:
         sentence_groups = sentences
+
+    # Add safety check for extremely long chunks
+    max_safe_chunk_length = 500  # Maximum safe chunk length
+    filtered_groups = []
+    for i, group in enumerate(sentence_groups):
+        if len(group) > max_safe_chunk_length:
+            print(f"\033[31m[WARNING] Chunk {i} is too long ({len(group)} chars). Splitting into smaller chunks.\033[0m")
+            # Split long chunks into smaller pieces
+            words = group.split()
+            current_chunk = ""
+            for word in words:
+                if len(current_chunk + " " + word) <= max_safe_chunk_length:
+                    current_chunk += (" " + word) if current_chunk else word
+                else:
+                    if current_chunk:
+                        filtered_groups.append(current_chunk.strip())
+                    current_chunk = word
+            if current_chunk:
+                filtered_groups.append(current_chunk.strip())
+        else:
+            filtered_groups.append(group)
+    
+    sentence_groups = filtered_groups
+    print(f"\033[32m[DEBUG] Final sentence groups: {len(sentence_groups)} chunks\033[0m")
 
     output_paths = []
     for gen_index in range(num_generations):
@@ -866,12 +1019,14 @@ def process_text_for_tts(
         print(f"\033[43m[DEBUG] Starting generation {gen_index+1}/{num_generations} with seed {this_seed}\033[0m")
 
         chunk_candidate_map = {}
-        waveform_list = []  # Initialize waveform_list here to ensure it’s defined
+        waveform_list = []  # Initialize waveform_list here to ensure it's defined
 
         # -------- CHUNK GENERATION --------
         if enable_parallel:
             total_chunks = len(sentence_groups)
             completed = 0
+            failed_chunks = 0
+            
             with ThreadPoolExecutor(max_workers=num_parallel_workers) as executor:
                 futures = [
                     executor.submit(
@@ -882,21 +1037,38 @@ def process_text_for_tts(
                     )
                     for idx, group in enumerate(sentence_groups)
                 ]
+                
                 for future in as_completed(futures):
-                    idx, candidates = future.result()
-                    chunk_candidate_map[idx] = candidates
-                    completed += 1
-                    percent = int(100 * completed / total_chunks)
-                    print(f"\033[36m[PROGRESS] Generated chunk {completed}/{total_chunks} ({percent}%)\033[0m")
+                    try:
+                        idx, candidates = future.result()
+                        chunk_candidate_map[idx] = candidates
+                        completed += 1
+                        percent = int(100 * completed / total_chunks)
+                        print(f"\033[36m[PROGRESS] Generated chunk {completed}/{total_chunks} ({percent}%)\033[0m")
+                    except Exception as e:
+                        failed_chunks += 1
+                        print(f"\033[31m[ERROR] Failed to process chunk: {e}\033[0m")
+                        if failed_chunks > total_chunks // 2:  # If more than half fail
+                            print(f"\033[31m[CRITICAL] Too many chunks failed ({failed_chunks}/{total_chunks}). Stopping generation.\033[0m")
+                            break
         else:
             # Sequential mode: Process chunks one by one
+            failed_chunks = 0
             for idx, group in enumerate(sentence_groups):
-                idx, candidates = process_one_chunk(
-                    model, group, idx, gen_index, this_seed,
-                    audio_prompt_path_input, exaggeration_input, temperature_input, cfgw_input,
-                    disable_watermark, num_candidates_per_chunk, max_attempts_per_candidate, bypass_whisper_checking
-                )
-                chunk_candidate_map[idx] = candidates
+                try:
+                    idx, candidates = process_one_chunk(
+                        model, group, idx, gen_index, this_seed,
+                        audio_prompt_path_input, exaggeration_input, temperature_input, cfgw_input,
+                        disable_watermark, num_candidates_per_chunk, max_attempts_per_candidate, bypass_whisper_checking
+                    )
+                    chunk_candidate_map[idx] = candidates
+                    print(f"\033[36m[PROGRESS] Generated chunk {idx+1}/{len(sentence_groups)}\033[0m")
+                except Exception as e:
+                    failed_chunks += 1
+                    print(f"\033[31m[ERROR] Failed to process chunk {idx}: {e}\033[0m")
+                    if failed_chunks > len(sentence_groups) // 2:  # If more than half fail
+                        print(f"\033[31m[CRITICAL] Too many chunks failed ({failed_chunks}/{len(sentence_groups)}). Stopping generation.\033[0m")
+                        break
 
         # -------- WHISPER VALIDATION --------
         if not bypass_whisper_checking:
@@ -924,7 +1096,7 @@ def process_text_for_tts(
                             continue
                         path, score, transcribed = whisper_check_mp(candidate_path, sentence_group, whisper_model, use_faster_whisper)
                         print(f"\033[32m[DEBUG] [Chunk {chunk_idx}] {os.path.basename(candidate_path)}: score={score:.3f}, transcript=\033[33m'{transcribed}'\033[0m")
-                        if score >= 0.95:
+                        if score >= 0.90:  # Lowered from 0.95 for better legal text handling
                             chunk_validations[chunk_idx].append((cand['duration'], cand['path']))
                         else:
                             chunk_failed_candidates[chunk_idx].append((score, cand['path'], transcribed))
@@ -978,7 +1150,7 @@ def process_text_for_tts(
                                     continue
                                 path, score, transcribed = whisper_check_mp(candidate_path, sentence_group, whisper_model, use_faster_whisper)
                                 print(f"\033[32m[DEBUG] [Chunk {chunk_idx}] RETRY {os.path.basename(candidate_path)}: score={score:.3f}, transcript=\033[33m'{transcribed}'\033[0m")
-                                if score >= 0.95:
+                                if score >= 0.90:  # Lowered from 0.95 for better legal text handling
                                     chunk_validations[chunk_idx].append((cand['duration'], cand['path']))
                                 else:
                                     chunk_failed_candidates[chunk_idx].append((score, cand['path'], transcribed))
@@ -995,8 +1167,19 @@ def process_text_for_tts(
                     if chunk_validations[chunk_idx]:
                         best_path = sorted(chunk_validations[chunk_idx], key=lambda x: x[0])[0][1]
                         print(f"\033[32m[DEBUG] Selected {best_path} as best candidate for chunk {chunk_idx} \033[1;33m(PASSED Whisper check)\033[0m")
-                        waveform, sr = torchaudio.load(best_path)
-                        waveform_list.append(waveform)
+                        try:
+                            waveform, sr = torchaudio.load(best_path)
+                            print(f"[DEBUG] Loaded waveform for chunk {chunk_idx}: shape={waveform.shape}, sr={sr}")
+                            
+                            # Normalize to mono (1, N)
+                            if waveform.ndim == 1:
+                                waveform = waveform.unsqueeze(0)  # (N,) -> (1, N)
+                            if waveform.shape[0] > 1:
+                                waveform = waveform.mean(dim=0, keepdim=True)  # Stereo/multi -> mono
+                            
+                            waveform_list.append(waveform)
+                        except Exception as e:
+                            print(f"[ERROR] Failed to load waveform for chunk {chunk_idx} ({best_path}): {e}")
                     elif chunk_failed_candidates[chunk_idx]:
                         if use_longest_transcript_on_fail:
                             best_failed = max(chunk_failed_candidates[chunk_idx], key=lambda x: len(x[2]))
@@ -1004,19 +1187,32 @@ def process_text_for_tts(
                         else:
                             best_failed = max(chunk_failed_candidates[chunk_idx], key=lambda x: x[0])
                             print(f"\033[33m[WARNING] No candidate passed for chunk {chunk_idx}. Using failed candidate with highest score: {best_failed[1]} (score={best_failed[0]:.3f})\033[0m")
-                        waveform, sr = torchaudio.load(best_failed[1])
-                        waveform_list.append(waveform)
+                        try:
+                            waveform, sr = torchaudio.load(best_failed[1])
+                            print(f"[DEBUG] Loaded waveform for chunk {chunk_idx}: shape={waveform.shape}, sr={sr}")
+                            
+                            # Normalize to mono (1, N)
+                            if waveform.ndim == 1:
+                                waveform = waveform.unsqueeze(0)  # (N,) -> (1, N)
+                            if waveform.shape[0] > 1:
+                                waveform = waveform.mean(dim=0, keepdim=True)  # Stereo/multi -> mono
+                            
+                            waveform_list.append(waveform)
+                        except Exception as e:
+                            print(f"[ERROR] Failed to load waveform for chunk {chunk_idx} ({best_failed[1]}): {e}")
                     else:
                         print(f"[ERROR] No candidates were generated for chunk {chunk_idx}.")
             finally:
                 # Clean up Whisper model
                 try:
-                    del whisper_model
+                    # del whisper_model  # Let's not do this, it might cause a segfault. The object is local and will be GC'd.
+                    if 'whisper_model' in locals() and whisper_model is not None:
+                        print("[DEBUG] Whisper model object exists. Clearing cache without deleting.")
                     torch.cuda.empty_cache()
                     gc.collect()
-                    print("\033[32m[DEBUG] Whisper model deleted and VRAM cache cleared.\033[0m")
+                    print("\033[32m[DEBUG] VRAM cache cleared after Whisper validation.\033[0m")
                 except Exception as e:
-                    print(f"\033[32m[DEBUG] Could not delete Whisper model: {e}\033[0m")
+                    print(f"\033[31m[ERROR] Failed during post-Whisper cleanup: {e}\033[0m")
         else:
             # Bypass Whisper: pick shortest duration per chunk
             for chunk_idx in sorted(chunk_candidate_map.keys()):
@@ -1026,28 +1222,58 @@ def process_text_for_tts(
                 if valid_candidates:
                     best = min(valid_candidates, key=lambda c: c['duration'])
                     print(f"\033[32m[DEBUG] [Bypass Whisper] Selected {best['path']} as shortest candidate for chunk {chunk_idx}\033[0m")
-                    waveform, sr = torchaudio.load(best['path'])
-                    waveform_list.append(waveform)
+                    try:
+                        waveform, sr = torchaudio.load(best['path'])
+                        print(f"[DEBUG] Loaded waveform for chunk {chunk_idx}: shape={waveform.shape}, sr={sr}")
+                        
+                        # Normalize to mono (1, N)
+                        if waveform.ndim == 1:
+                            waveform = waveform.unsqueeze(0)  # (N,) -> (1, N)
+                        if waveform.shape[0] > 1:
+                            waveform = waveform.mean(dim=0, keepdim=True)  # Stereo/multi -> mono
+                        
+                        waveform_list.append(waveform)
+                    except Exception as e:
+                        print(f"[ERROR] Failed to load waveform for chunk {chunk_idx} ({best['path']}): {e}")
                 else:
                     print(f"\033[33m[WARNING] No valid candidates found for chunk {chunk_idx} (all generations failed)\033[0m")
                     
 
         if not waveform_list:
-            print(f"\033[33m[WARNING] No audio generated in generation {gen_index+1}\033[0m")
+            print(f"\033[33m[WARNING] No audio generated in generation {gen_index+1} (empty waveform_list)\033[0m")
             continue
 
-        full_audio = torch.cat(waveform_list, dim=1)
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")[:-3]
-        filename_suffix = f"{timestamp}_gen{gen_index+1}_seed{this_seed}"
-        wav_output = f"output/{input_basename}audio_{filename_suffix}.wav"
-        torchaudio.save(wav_output, full_audio, model.sr)
+        try:
+            print(f"[DEBUG] Concatenating {len(waveform_list)} waveforms...")
+            full_audio = torch.cat(waveform_list, dim=1)
+            print(f"[DEBUG] Full audio shape: {full_audio.shape}")
+        except Exception as e:
+            print(f"[ERROR] Failed to concatenate waveforms: {e}")
+            print("Waveform shapes:")
+            for i, w in enumerate(waveform_list):
+                print(f"  Chunk {i}: {w.shape}")
+            continue  # Skip save if cat fails
+        
+        # Generate clean filename based on input file name
+        clean_filename = generate_clean_filename(input_basename, "wav", gen_index, num_generations)
+        wav_output = f"output/{clean_filename}"
+        
+        try:
+            torchaudio.save(wav_output, full_audio, model.sr)
+            print(f"[DEBUG] Saved WAV: {wav_output}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save WAV {wav_output}: {e}")
+            continue  # Skip rest of processing if save fails
+        
         print(f"\33[104m[DEBUG] \33[5mFinal audio concatenated, output file: {wav_output}\033[0m")
 
         if use_auto_editor:
             try:
-                cleaned_output = wav_output.replace(".wav", "_cleaned.wav")
+                # Use clean naming for auto-editor files
+                clean_filename = generate_clean_filename(input_basename, "wav", gen_index, num_generations)
+                cleaned_output = f"output/{clean_filename.replace('.wav', '_cleaned.wav')}"
                 if keep_original_wav:
-                    backup_path = wav_output.replace(".wav", "_original.wav")
+                    backup_path = f"output/{clean_filename.replace('.wav', '_original.wav')}"
                     os.rename(wav_output, backup_path)
                     auto_editor_input = backup_path
                 else:
@@ -1062,7 +1288,14 @@ def process_text_for_tts(
                     "-o", cleaned_output
                 ]
 
-                subprocess.run(auto_editor_cmd, check=True)
+                result = subprocess.run(auto_editor_cmd, check=False, capture_output=True, text=True)
+                if result.returncode != 0:
+                    print(f"[WARNING] Auto-editor returned non-zero exit code: {result.returncode}")
+                    print(f"[WARNING] Auto-editor stderr: {result.stderr}")
+                    print("[INFO] Continuing without auto-editor processing...")
+                    # Don't raise an exception, just continue
+                else:
+                    print(f"[DEBUG] Auto-editor completed successfully")
 
                 if os.path.exists(cleaned_output):
                     os.replace(cleaned_output, wav_output)
@@ -1072,7 +1305,9 @@ def process_text_for_tts(
 
         if normalize_audio:
             try:
-                norm_temp = wav_output.replace(".wav", "_norm.wav")
+                # Use clean naming for normalization files
+                clean_filename = generate_clean_filename(input_basename, "wav", gen_index, num_generations)
+                norm_temp = f"output/{clean_filename.replace('.wav', '_norm.wav')}"
                 normalize_with_ffmpeg(
                     wav_output,
                     norm_temp,
@@ -1091,7 +1326,9 @@ def process_text_for_tts(
                 gen_outputs.append(wav_output)
             else:
                 audio = AudioSegment.from_wav(wav_output)
-                final_output = wav_output.replace(".wav", f".{export_format}")
+                # Generate clean filename for each export format
+                clean_filename = generate_clean_filename(input_basename, export_format, gen_index, num_generations)
+                final_output = f"output/{clean_filename}"
                 export_kwargs = {}
                 if export_format.lower() == "mp3":
                     export_kwargs["bitrate"] = "320k"
@@ -1236,15 +1473,16 @@ def apply_settings_json(settings_json):
 
 
 def main():
-    with gr.Blocks() as demo:
+    with gr.Blocks(title="Chatterbox TTS Extended", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 🎧 Chatterbox TTS Extended")
+        gr.Markdown("**💡 Tip:** This interface will stay open after processing. You can continue to use it for multiple generations!")
         with gr.Tabs():
             # TTS Tab (your original interface)
             with gr.Tab("TTS & Multi-Gen"):
                 with gr.Row():
                     with gr.Column():
                         text_input = gr.Textbox(label="Text Input", lines=6, value=settings["text_input"])
-                        text_file_input = gr.File(label="Text File(s) (.txt)", file_types=[".txt"], file_count="multiple")
+                        text_file_input = gr.File(label="Text File(s) (.txt, .md)", file_types=[".txt", ".md"], file_count="multiple")
                         separate_files_checkbox = gr.Checkbox(label="Generate separate audio files per text file", value=settings["separate_files_checkbox"])
                         ref_audio_input = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Reference Audio (Optional)")
                         export_format_checkboxes = gr.CheckboxGroup(
@@ -1287,7 +1525,7 @@ def main():
                         normalize_spacing_checkbox = gr.Checkbox(label="Normalize spacing (remove extra newlines and spaces)", value=settings["normalize_spacing_checkbox"])
                         fix_dot_letters_checkbox = gr.Checkbox(label="Convert 'J.R.R.' style input to 'J R R'", value=settings["fix_dot_letters_checkbox"])
                         remove_reference_numbers_checkbox = gr.Checkbox(
-                            label="Remove inline reference numbers after sentences (e.g., '.188', '.”3')",
+                            label="Remove inline reference numbers after sentences (e.g., '.188', '.3')",
                             value=settings.get("remove_reference_numbers_checkbox", True)
                         )
                         
@@ -1706,12 +1944,58 @@ def main():
             ---
 
             **Still have questions?**  
-            This interface aims to expose every option for maximum control, but if you’re unsure, try using defaults for most sliders and options.
+            This interface aims to expose every option for maximum control, but if you're unsure, try using defaults for most sliders and options.
             """,
             elem_classes=["gr-text-center"]
 
             )
 
-        demo.launch()
+        try:
+            demo.launch(
+                server_name="127.0.0.1",
+                server_port=7860,
+                inbrowser=True,
+                share=False,
+                debug=False,
+                prevent_thread_lock=False,
+                show_error=True,
+                quiet=False,
+                show_tips=False,
+                enable_queue=True
+            )
+        except KeyboardInterrupt:
+            print("\n[INFO] Server stopped by user (Ctrl+C)")
+        except Exception as e:
+            print(f"[ERROR] Server error: {e}")
+            print("[INFO] Restarting server...")
+            # Try to restart the server
+            try:
+                demo.launch(
+                    server_name="127.0.0.1",
+                    server_port=7861,  # Try different port in case of conflict
+                    inbrowser=False,
+                    share=False,
+                    debug=False,
+                    prevent_thread_lock=False,
+                    show_error=True,
+                    quiet=False,
+                    show_tips=False,
+                    enable_queue=True
+                )
+            except Exception as e2:
+                print(f"[ERROR] Failed to restart server: {e2}")
+                print("[INFO] Please restart the application manually.")
 if __name__ == "__main__":
-    main()
+    try:
+        print("[INFO] 🎧 Starting Chatterbox TTS Extended...")
+        print("[INFO] 🔄 Interface will remain open after processing for multiple generations.")
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] 👋 Application stopped by user (Ctrl+C)")
+    except Exception as e:
+        print(f"[ERROR] 💥 Application error: {e}")
+        print("[INFO] 🔄 Please restart the application.")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("[INFO] 🏁 Application ended.")
