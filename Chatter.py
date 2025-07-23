@@ -231,16 +231,64 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"🚀 Running on device: {DEVICE}")
 
+# Global model management
 MODEL = None
+WHISPER_MODEL = None  # Global persistent Whisper model
+WHISPER_MODEL_CONFIG = {"model_key": None, "use_faster_whisper": None, "device": None}
+
+def get_or_load_whisper_model(model_key, use_faster_whisper, device):
+    """
+    Get or load Whisper model globally to prevent repeated load/unload cycles that cause segfaults.
+    """
+    global WHISPER_MODEL, WHISPER_MODEL_CONFIG
+    
+    # Check if we need to load a new model (config changed)
+    current_config = {"model_key": model_key, "use_faster_whisper": use_faster_whisper, "device": device}
+    
+    if WHISPER_MODEL is None or WHISPER_MODEL_CONFIG != current_config:
+        print(f"[DEBUG] Loading/reloading Whisper model: {model_key} (faster-whisper: {use_faster_whisper})")
+        
+        # If we have an existing model, try to clean it up safely
+        if WHISPER_MODEL is not None:
+            try:
+                print("[DEBUG] Safely cleaning up previous Whisper model...")
+                torch.cuda.empty_cache()
+                gc.collect()
+                time.sleep(0.1)  # Give GC time to work
+            except Exception as e:
+                print(f"[WARNING] Error during Whisper model cleanup: {e}")
+        
+        # Load new model
+        try:
+            WHISPER_MODEL = load_whisper_backend(model_key, use_faster_whisper, device)
+            WHISPER_MODEL_CONFIG = current_config
+            print(f"[DEBUG] Whisper model loaded successfully: {model_key}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load Whisper model {model_key}: {e}")
+            WHISPER_MODEL = None
+            WHISPER_MODEL_CONFIG = {"model_key": None, "use_faster_whisper": None, "device": None}
+            raise
+    else:
+        print(f"[DEBUG] Using existing Whisper model: {model_key}")
+    
+    return WHISPER_MODEL
 
 def load_whisper_backend(model_name, use_faster_whisper, device):
-    if use_faster_whisper:
-        print(f"[DEBUG] Loading faster-whisper model: {model_name}")
-        return FasterWhisperModel(model_name, device=device, compute_type="float16" if device=="cuda" else "float32")
-    else:
-        import whisper
-        print(f"[DEBUG] Loading openai-whisper model: {model_name}")
-        return whisper.load_model(model_name, device=device)
+    """Load Whisper backend with enhanced error handling."""
+    try:
+        if use_faster_whisper:
+            print(f"[DEBUG] Loading faster-whisper model: {model_name}")
+            return FasterWhisperModel(model_name, device=device, compute_type="float16" if device=="cuda" else "float32")
+        else:
+            import whisper
+            print(f"[DEBUG] Loading openai-whisper model: {model_name}")
+            return whisper.load_model(model_name, device=device)
+    except Exception as e:
+        print(f"[ERROR] Failed to load Whisper backend {model_name}: {e}")
+        # Clean up any partial state
+        torch.cuda.empty_cache()
+        gc.collect()
+        raise
 
 def get_or_load_model():
     global MODEL
@@ -1084,7 +1132,7 @@ def process_text_for_tts(
         if not bypass_whisper_checking:
             print(f"\033[32m[DEBUG] Validating all candidates with Whisper for all chunks (sequentially)...\033[0m")
             model_key = whisper_model_map.get(whisper_model_name, "medium")
-            whisper_model = load_whisper_backend(model_key, use_faster_whisper, DEVICE)
+            whisper_model = get_or_load_whisper_model(model_key, use_faster_whisper, DEVICE)
             # Load model once
             try:
                 all_candidates = []
@@ -1213,16 +1261,14 @@ def process_text_for_tts(
                     else:
                         print(f"[ERROR] No candidates were generated for chunk {chunk_idx}.")
             finally:
-                # Clean up Whisper model
+                # Safe cleanup - only clear cache, don't unload the global model
                 try:
-                    # del whisper_model  # Let's not do this, it might cause a segfault. The object is local and will be GC'd.
-                    if 'whisper_model' in locals() and whisper_model is not None:
-                        print("[DEBUG] Whisper model object exists. Clearing cache without deleting.")
+                    print("[DEBUG] Clearing VRAM cache after Whisper validation (keeping model loaded)...")
                     torch.cuda.empty_cache()
                     gc.collect()
-                    print("\033[32m[DEBUG] VRAM cache cleared after Whisper validation.\033[0m")
+                    print("\033[32m[DEBUG] VRAM cache cleared after Whisper validation. Model remains loaded for next use.\033[0m")
                 except Exception as e:
-                    print(f"\033[31m[ERROR] Failed during post-Whisper cleanup: {e}\033[0m")
+                    print(f"\033[31m[ERROR] Failed during post-Whisper cache cleanup: {e}\033[0m")
         else:
             # Bypass Whisper: pick shortest duration per chunk
             for chunk_idx in sorted(chunk_candidate_map.keys()):
@@ -1255,13 +1301,34 @@ def process_text_for_tts(
 
         try:
             print(f"[DEBUG] Concatenating {len(waveform_list)} waveforms...")
+            
+            # Validate all waveforms before concatenation
+            for i, w in enumerate(waveform_list):
+                if w is None:
+                    raise ValueError(f"Waveform {i} is None")
+                if w.numel() == 0:
+                    raise ValueError(f"Waveform {i} is empty")
+                if w.shape[0] != 1:
+                    print(f"[WARNING] Waveform {i} has unexpected channels: {w.shape[0]}, converting to mono")
+                    w = w.mean(dim=0, keepdim=True)
+                    waveform_list[i] = w
+            
+            # Safe concatenation
             full_audio = torch.cat(waveform_list, dim=1)
             print(f"[DEBUG] Full audio shape: {full_audio.shape}")
+            
+            # Validate output
+            if full_audio.numel() == 0:
+                raise ValueError("Concatenated audio is empty")
+                
         except Exception as e:
             print(f"[ERROR] Failed to concatenate waveforms: {e}")
-            print("Waveform shapes:")
+            print("Waveform details:")
             for i, w in enumerate(waveform_list):
-                print(f"  Chunk {i}: {w.shape}")
+                if w is not None:
+                    print(f"  Chunk {i}: shape={w.shape}, dtype={w.dtype}, device={w.device}")
+                else:
+                    print(f"  Chunk {i}: None")
             continue  # Skip save if cat fails
         
         # Generate clean filename based on input file name
@@ -1298,12 +1365,10 @@ def process_text_for_tts(
                     "-o", cleaned_output
                 ]
 
-                result = subprocess.run(auto_editor_cmd, check=False, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"[WARNING] Auto-editor returned non-zero exit code: {result.returncode}")
-                    print(f"[WARNING] Auto-editor stderr: {result.stderr}")
-                    print("[INFO] Continuing without auto-editor processing...")
-                    # Don't raise an exception, just continue
+                # Use safe subprocess with timeout to prevent hangs/crashes
+                auto_editor_success = safe_subprocess_run(auto_editor_cmd, timeout=300)
+                if not auto_editor_success:
+                    print("[INFO] Auto-editor failed or timed out. Continuing without auto-editor processing...")
                 else:
                     print(f"[DEBUG] Auto-editor completed successfully")
 
@@ -1961,6 +2026,7 @@ def main():
             )
 
         try:
+            print("[INFO] 🌐 Starting web server on http://127.0.0.1:7860")
             demo.launch(
                 server_name="127.0.0.1",
                 server_port=7860,
@@ -1972,10 +2038,18 @@ def main():
                 quiet=False
             )
         except KeyboardInterrupt:
-            print("\n[INFO] Server stopped by user (Ctrl+C)")
+            print("\n[INFO] 🛑 Server stopped by user (Ctrl+C)")
+            cleanup_models()
         except Exception as e:
-            print(f"[ERROR] Server error: {e}")
-            print("[INFO] Restarting server...")
+            print(f"[ERROR] 💥 Server error: {e}")
+            print("[INFO] 🔄 Attempting to restart server...")
+            import traceback
+            traceback.print_exc()
+            
+            # Clean up models before restart attempt
+            cleanup_models()
+            time.sleep(1)
+            
             # Try to restart the server
             try:
                 demo.launch(
@@ -1989,8 +2063,62 @@ def main():
                     quiet=False
                 )
             except Exception as e2:
-                print(f"[ERROR] Failed to restart server: {e2}")
-                print("[INFO] Please restart the application manually.")
+                print(f"[ERROR] 💥 Failed to restart server: {e2}")
+                print("[INFO] ℹ️ Please restart the application manually.")
+                cleanup_models()
+
+def cleanup_models():
+    """Safely cleanup all loaded models at application shutdown."""
+    global MODEL, WHISPER_MODEL
+    
+    print("[INFO] 🧹 Cleaning up models for shutdown...")
+    
+    # Clean up Whisper model safely
+    if WHISPER_MODEL is not None:
+        try:
+            print("[DEBUG] Safely unloading Whisper model...")
+            WHISPER_MODEL = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            time.sleep(0.2)  # Give more time for cleanup
+            print("[DEBUG] Whisper model cleaned up successfully")
+        except Exception as e:
+            print(f"[WARNING] Error during Whisper model cleanup: {e}")
+    
+    # Clean up TTS model
+    if MODEL is not None:
+        try:
+            print("[DEBUG] Cleaning up TTS model...")
+            MODEL = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            print("[DEBUG] TTS model cleaned up successfully")
+        except Exception as e:
+            print(f"[WARNING] Error during TTS model cleanup: {e}")
+    
+    print("[INFO] ✅ Model cleanup completed")
+
+def safe_subprocess_run(cmd, timeout=300, **kwargs):
+    """Run subprocess with timeout and enhanced error handling."""
+    try:
+        print(f"[DEBUG] Running command with {timeout}s timeout: {' '.join(cmd)}")
+        result = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True, **kwargs)
+        
+        if result.returncode != 0:
+            print(f"[WARNING] Command returned non-zero exit code: {result.returncode}")
+            print(f"[WARNING] stderr: {result.stderr}")
+            return False
+        
+        print(f"[DEBUG] Command completed successfully")
+        return True
+        
+    except subprocess.TimeoutExpired:
+        print(f"[ERROR] Command timed out after {timeout} seconds")
+        return False
+    except Exception as e:
+        print(f"[ERROR] Command failed: {e}")
+        return False
+
 if __name__ == "__main__":
     try:
         print("[INFO] 🎧 Starting Chatterbox TTS Extended...")
@@ -2005,3 +2133,4 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         print("[INFO] 🏁 Application ended.")
+        cleanup_models()
